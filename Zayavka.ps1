@@ -1,5 +1,5 @@
 # ==========================================================
-# 🚀 ФОРМА ЗАЯВКИ 3.7.9 (DASHBOARD PROJECTS FIX)
+# 🚀 ФОРМА ЗАЯВКИ 3.7.9 (DASHBOARD + EDIT RIGHTS)
 # ==========================================================
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path $MyInvocation.MyCommand.Path
@@ -15,7 +15,7 @@ $smtpCfg = @{
     Port     = 25
     From     = ""
     User     = ""
-    Password = 
+    Password = ''
 }
 
 $dbMutex = New-Object System.Threading.Mutex($false, "ZayavkaDbMutex_v3")
@@ -433,6 +433,16 @@ function Notify-AllParticipants($req, $newStatus, $actor, $comment, $eventType =
                 }
             }
         }
+        "edit_request" {
+            $recipients = @()
+            $au = $db.auth.users | Where-Object { $_.name -eq $req.author -and $_.deleted -eq $false -and $_.name -ne $actor }; if ($au) { $recipients += $au.username }
+            if ($req.takenBy -and $req.takenBy -ne $actor) { $eu = $db.auth.users | Where-Object { $_.name -eq $req.takenBy -and $_.deleted -eq $false }; if ($eu) { $recipients += $eu.username } }
+            $db.auth.users | Where-Object { $_.role -eq "director" -and $_.verified -and $_.deleted -eq $false -and $_.name -ne $actor } | ForEach-Object { $recipients += $_.username }
+            $db.auth.users | Where-Object { $_.role -eq "procurement" -and $_.verified -and $_.deleted -eq $false -and $_.name -ne $actor } | ForEach-Object { $recipients += $_.username }
+            foreach ($email in ($recipients | Select-Object -Unique)) {
+                Send-Mail $email "✏️ Заявка $($req.id) изменена" "<p><b>$actorDisplay</b> внёс изменения в заявку <b>$($req.id)</b>.</p><p><b>Изменения:</b> $comment</p><p><a href='http://localhost:$port'>Открыть</a></p>"
+            }
+        }
     }
 }
 
@@ -474,17 +484,85 @@ function Action-CreateRequest($proj, $dead, $body, $author, $priority = "medium"
     return @{ok=$true; id=$id}
 }
 
+# 🔥 ИСПРАВЛЕНО: Проверки прав редактирования по ролям
 function Action-EditRequest($id, $newBody, $newDead, $newPriority, $actor, $budget) {
-    $db = Get-Db; $r = $db.requests | Where-Object {$_.id -eq $id}; if (-not $r) { return @{ok=$false; error="Не найдено"} }
-    $user = $db.auth.users | Where-Object { $_.name -eq $actor }; if (-not $user) { return @{ok=$false; error="Пользователь не найден"} }
-    if ($r.author -eq $actor -and $r.status -ne "Отправлено на рассмотрение") { return @{ok=$false; error="Редактирование невозможно"} }
-    if ($user.role -eq "client" -and $r.author -ne $actor) { return @{ok=$false; error="Нет прав"} }
+    $db = Get-Db
+    $r = $db.requests | Where-Object {$_.id -eq $id}
+    if (-not $r) { return @{ok=$false; error="Заявка не найдена"} }
+    
+    # Определяем роль действующего лица
+    $user = $db.auth.users | Where-Object { $_.name -eq $actor -and $_.deleted -eq $false } | Select-Object -First 1
+    if (-not $user) { return @{ok=$false; error="Пользователь не найден"} }
+    
+    $isAuthor = ($r.author -eq $actor)
+    $role = $user.role
+    $finalStatuses = @("Оплачено", "Отклонено", "Договорённость")
+    $isFinalStatus = $finalStatuses -contains $r.status
+    
+    # === ПРОВЕРКИ ПО РОЛЯМ ===
+    
+    # 1. ЗАКАЗЧИК (автор): может редактировать только если статус "Отправлено на рассмотрение"
+    if ($role -eq "client") {
+        if (-not $isAuthor) { return @{ok=$false; error="Нет прав: вы не автор заявки"} }
+        if ($r.status -ne "Отправлено на рассмотрение") {
+            return @{ok=$false; error="Редактирование невозможно: заявка уже обрабатывается"}
+        }
+        # Заказчик может менять: body, deadline, budget, priority
+    }
+    
+    # 2. СНАБЖЕНИЕ: может редактировать на любом статусе КРОМЕ финальных, но НЕ может менять priority
+    elseif ($role -eq "procurement") {
+        if ($isFinalStatus) {
+            return @{ok=$false; error="Редактирование невозможно: заявка в финальном статусе ($($r.status))"}
+        }
+        # Снабжение НЕ может менять приоритет - сбрасываем к исходному значению
+        if ($newPriority -and $newPriority -ne $r.priority) {
+            Write-Host "⚠️  Снабжение ($actor) пыталось изменить приоритет - отклонено" -ForegroundColor Yellow
+            $newPriority = $r.priority
+        }
+        # Снабжение может менять: body, deadline, budget
+    }
+    
+    # 3. РУКОВОДСТВО: может редактировать ВСЁ на любом статусе
+    elseif ($role -eq "director") {
+        # Без ограничений
+    }
+    
+    # 4. Неизвестная роль
+    else {
+        return @{ok=$false; error="Нет прав на редактирование"}
+    }
+    
+    # === ПРИМЕНЕНИЕ ИЗМЕНЕНИЙ ===
     $changes = @()
-    if ($r.body -ne $newBody) { $changes += "Описание"; $r.body = $newBody }
-    if ($r.deadline -ne $newDead) { $changes += "Срок"; $r.deadline = $newDead }
-    if ($r.priority -ne $newPriority) { $changes += "Приоритет"; $r.priority = $newPriority }
-    if ($budget -ne $null -and $r.budget -ne $budget) { $changes += "Бюджет"; $r.budget = $budget }
-    if ($changes.Count -gt 0) { AddAuditEntry $r $actor $r.status ("Изменено: " + ($changes -join ", ")) "Редактирование"; Set-Db $db; Notify-AllParticipants $r $r.status $actor ($changes -join ", ") "edit_request" }
+    
+    if ($newBody -and $newBody -ne $r.body) { 
+        $changes += "Описание"
+        $r.body = $newBody 
+    }
+    if ($newDead -and $newDead -ne $r.deadline) { 
+        $changes += "Срок"
+        $r.deadline = $newDead 
+    }
+    if ($newPriority -and $newPriority -ne $r.priority) { 
+        $changes += "Приоритет"
+        $r.priority = $newPriority 
+    }
+    if ($budget -ne $null -and $budget -ne $r.budget) { 
+        $changes += "Бюджет"
+        $r.budget = $budget 
+    }
+    
+    if ($changes.Count -gt 0) { 
+        $changesText = "Изменено: " + ($changes -join ", ")
+        AddAuditEntry $r $actor $r.status $changesText "Редактирование"
+        Set-Db $db
+        Notify-AllParticipants $r $r.status $actor $changesText "edit_request"
+        Write-Host "✅ Заявка $id отредактирована ($actor, $role): $($changes -join ', ')" -ForegroundColor Green
+    } else {
+        Write-Host "ℹ️  Заявка $id: изменений нет" -ForegroundColor Gray
+    }
+    
     return @{ok=$true}
 }
 
@@ -606,7 +684,7 @@ function Export-Excel($force = $false) {
 }
 
 # ==========================================================
-# 🎨 БЛОК 9: UI (ИСПРАВЛЕННЫЙ GANTT + FULL APP)
+# 🎨 БЛОК 9: UI (DASHBOARD + FULL APP)
 # ==========================================================
 $ui = @'
 <!DOCTYPE html>
@@ -707,8 +785,6 @@ td .btn{margin-right:4px;margin-bottom:4px;white-space:nowrap}
 .mass-actions-bar .btn{background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.3)}
 .mass-actions-bar .btn:hover{background:rgba(255,255,255,.3)}
 .project-link{color:var(--primary);cursor:pointer;text-decoration:underline}.project-link:hover{color:var(--primary-dark)}
-
-/* ===== GANTT STYLES ===== */
 .gantt-card{padding:24px;margin-bottom:20px;position:relative;overflow:hidden}
 .gantt-card::before{content:'';position:absolute;top:0;left:0;width:4px;height:100%;background:linear-gradient(180deg,#a8d5ff 0%,#1a73e8 100%)}
 .gantt-card.overdue::before{background:linear-gradient(180deg,#ffcccc 0%,#d93025 100%)}
@@ -721,13 +797,12 @@ td .btn{margin-right:4px;margin-bottom:4px;white-space:nowrap}
 .countdown.overdue{background:linear-gradient(135deg,#ffebee 0%,#ffcdd2 100%)}
 .countdown.completed{background:linear-gradient(135deg,#e8f5e9 0%,#c8e6c9 100%)}
 .countdown-label{font-size:11px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
-.countdown-time{font-size:1.4rem;font-weight:600;color:var(--primary);font-family:'Courier New',monospace;letter-spacing:1px}
+.countdown-time{font-size:1.4rem;font-weight:600;color:var(--primary);font-family:'Courier New',monospace;letter-spacing:1px;white-space:nowrap;font-size:clamp(0.9rem,2.5vw,1.4rem)}
 .countdown.overdue .countdown-time{color:var(--danger)}
 .countdown.completed .countdown-time{color:var(--success);font-size:1.1rem}
 .countdown-ds{font-size:.8rem;color:#7baaf7;font-weight:500}
 .countdown.overdue .countdown-ds{color:#e57373}
 .countdown.completed .countdown-ds{color:#66bb6a}
-
 .gantt-track{position:relative;height:80px;background:var(--gray-light);border-radius:12px;overflow:hidden;border:1px solid var(--border-light);margin-top:16px}
 .gantt-bar{position:absolute;top:10px;height:60px;border-radius:8px;background:linear-gradient(90deg,#bbdefb 0%,#64b5f6 40%,#1a73e8 100%);box-shadow:0 2px 8px rgba(26,115,232,.3);display:flex;align-items:center;justify-content:space-around;padding:0 8px;transition:all .3s}
 .gantt-bar.overdue{background:linear-gradient(90deg,#ffcdd2 0%,#ef5350 40%,#d93025 100%);box-shadow:0 2px 8px rgba(217,48,37,.3)}
@@ -754,8 +829,6 @@ td .btn{margin-right:4px;margin-bottom:4px;white-space:nowrap}
 .gantt-legend-item{display:flex;align-items:center;gap:6px}
 .gantt-legend-dot{width:10px;height:10px;border-radius:50%}
 .gantt-legend-bar{width:40px;height:12px;border-radius:6px}
-.countdown-time{white-space:nowrap;font-size:clamp(0.9rem,2.5vw,1.4rem)}
-
 @media(max-width:700px){body{padding:10px}.grid{grid-template-columns:1fr}header{flex-direction:column;align-items:stretch}.notification-dropdown{width:92%;right:4%}.dashboard-grid{grid-template-columns:1fr 1fr}.gantt-header{flex-direction:column;gap:12px}.countdown{min-width:auto;text-align:left}}
 </style>
 </head>
@@ -777,7 +850,6 @@ td .btn{margin-right:4px;margin-bottom:4px;white-space:nowrap}
 
 <div id="notificationDropdown" class="notification-dropdown"><div style="padding:12px 16px;border-bottom:1px solid var(--border-light);font-weight:600;display:flex;justify-content:space-between;align-items:center"><span>🔔 Уведомления</span><button class="btn btn-sm btn-gra" onclick="event.stopPropagation();clearNotifications()">Очистить</button></div><div id="notificationList"></div></div>
 
-<!-- Modals -->
 <div id="mdl" class="modal"><div class="modal-c"><h3 id="mtl">Заявка</h3><form id="frm"><input type="hidden" id="fid"><label>Проект</label><input id="fpr" readonly><label>Срок выполнения</label><input type="date" id="fdd" required><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px"><div><label>Приоритет</label><select id="fpriority"><option value="low">🟢 Низкий</option><option value="medium" selected>🟡 Средний</option><option value="high">🔴 Высокий</option></select></div><div><label>💰 Бюджет (₽)</label><input type="number" id="fbudget" placeholder="0" min="0"></div></div><label>Описание</label><textarea id="fbd" rows="4" required></textarea><div class="file-upload-area" id="fileUploadArea"><p>📎 Перетащите файлы сюда или <b>нажмите для выбора</b></p><input type="file" id="fileInput" multiple style="display:none"><div id="selectedFiles" class="file-list"></div></div><div class="modal-buttons"><button type="submit" class="btn btn-pri">💾 Сохранить</button><button type="button" class="btn btn-gra" id="modalCancel">Отмена</button></div></form></div></div>
 <div id="commentModal" class="modal"><div class="modal-c"><h3 id="commentTitle">Комментарий</h3><textarea id="commentText" rows="3" placeholder="Введите комментарий..."></textarea><div class="modal-buttons"><button class="btn btn-pri" id="submitCommentBtn">Подтвердить</button><button class="btn btn-gra" id="cancelCommentBtn">Отмена</button></div></div></div>
 <div id="projectModal" class="modal"><div class="modal-c"><h3>Новый проект</h3><label>Название</label><input type="text" id="projectName" placeholder="Название"><label>Крайний срок</label><input type="date" id="projectDeadline" required><div class="modal-buttons"><button class="btn btn-pri" id="createProjectBtn">Создать</button><button class="btn btn-gra" id="cancelProjectBtn">Отмена</button></div></div></div>
@@ -801,42 +873,39 @@ let D=null,CP=null,U=null,PE=null,IsArch=false,TOKEN=null;
 let notifications=[],lastCheckTime=null,checkInterval=null,ganttInterval=null;
 let selectedMassIds=[],selectedFilesForUpload=[];
 
-// ===== GANTT TIMER ENGINE =====
 function startGanttTimers(){
     if(ganttInterval)cancelAnimationFrame(ganttInterval);
     function tick(){
-    const now=Date.now();
-    document.querySelectorAll('[data-deadline]').forEach(el=>{
-        const dl=parseInt(el.dataset.deadline);
-        const diff=dl-now;
-        const timeEl=el.querySelector('.countdown-time');
-        const dsEl=el.querySelector('.countdown-ds');
-        if(!timeEl||!dsEl)return;
-        if(diff>0){
-            const d=Math.floor(diff/86400000);
-            const h=Math.floor((diff%86400000)/3600000);
-            const m=Math.floor((diff%3600000)/60000);
-            const s=Math.floor((diff%60000)/1000);
-            const ds=Math.floor((diff%1000)/100);
-            // ✅ Одна строка: 85д 12:34:56.7
-            timeEl.textContent=`${String(d).padStart(2,'0')}д ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${ds}`;
-            dsEl.textContent='';
-            el.classList.remove('overdue');
-        }else{
-            const ad=Math.abs(diff);
-            const d=Math.floor(ad/86400000);
-            const h=Math.floor((ad%86400000)/3600000);
-            const m=Math.floor((ad%3600000)/60000);
-            const s=Math.floor((ad%60000)/1000);
-            const ds=Math.floor((ad%1000)/100);
-            // ✅ Одна строка: -05д 03:22:11.4
-            timeEl.textContent=`-${String(d).padStart(2,'0')}д ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${ds}`;
-            dsEl.textContent='';
-            el.classList.add('overdue');
-        }
-    });
-    ganttInterval=requestAnimationFrame(tick);
-}
+        const now=Date.now();
+        document.querySelectorAll('[data-deadline]').forEach(el=>{
+            const dl=parseInt(el.dataset.deadline);
+            const diff=dl-now;
+            const timeEl=el.querySelector('.countdown-time');
+            const dsEl=el.querySelector('.countdown-ds');
+            if(!timeEl||!dsEl)return;
+            if(diff>0){
+                const d=Math.floor(diff/86400000);
+                const h=Math.floor((diff%86400000)/3600000);
+                const m=Math.floor((diff%3600000)/60000);
+                const s=Math.floor((diff%60000)/1000);
+                const ds=Math.floor((diff%1000)/100);
+                timeEl.textContent=`${String(d).padStart(2,'0')}д ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${ds}`;
+                dsEl.textContent='';
+                el.classList.remove('overdue');
+            }else{
+                const ad=Math.abs(diff);
+                const d=Math.floor(ad/86400000);
+                const h=Math.floor((ad%86400000)/3600000);
+                const m=Math.floor((ad%3600000)/60000);
+                const s=Math.floor((ad%60000)/1000);
+                const ds=Math.floor((ad%1000)/100);
+                timeEl.textContent=`-${String(d).padStart(2,'0')}д ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${ds}`;
+                dsEl.textContent='';
+                el.classList.add('overdue');
+            }
+        });
+        ganttInterval=requestAnimationFrame(tick);
+    }
     tick();
 }
 function stopGanttTimers(){if(ganttInterval){cancelAnimationFrame(ganttInterval);ganttInterval=null}}
@@ -883,89 +952,49 @@ async function deleteFromArchive(name){if(!confirm(`Удалить "${name}" и�
 async function showDeleteUserModal(){const s=document.getElementById('deleteUserSelect');s.innerHTML='<option value="">-- Выберите --</option>';D.auth.users.forEach(u=>{if(!u.deleted)s.innerHTML+=`<option value="${escapeHtml(u.username)}">${escapeHtml(u.name)} (${getRoleName(u.role)})</option>`});document.getElementById('deleteUserModal').style.display='flex'}
 async function confirmDeleteUser(){const u=document.getElementById('deleteUserSelect').value;if(!u)return;if(!confirm('Удалить пользователя?'))return;const res=await api('/delete-user',{username:u});if(res.error)showNotification(res.error);else{showNotification(res.message,"Успешно");document.getElementById('deleteUserModal').style.display='none';await loadData()}}
 
-// ===== ИСПРАВЛЕННЫЙ GANTT RENDERER =====
 function renderGanttDashboard(){
     stopGanttTimers();
     const container=document.getElementById('cnt');
     const projects=D.projects.active||[];
     const allReqs=D.requests||[];
-    
     let statsHtml=`<div class="dashboard-grid">
         <div class="dashboard-card"><div class="label">Активных проектов</div><div class="big-number">${projects.length}</div></div>
         <div class="dashboard-card warning"><div class="label">Заявок в работе</div><div class="big-number">${allReqs.filter(r=>r.status==='Выполняется').length}</div></div>
         <div class="dashboard-card danger"><div class="label">Просрочено</div><div class="big-number">${allReqs.filter(r=>isOverdue(r)).length}</div></div>
         <div class="dashboard-card success"><div class="label">Завершено</div><div class="big-number">${allReqs.filter(r=>r.status==='Оплачено'||r.status==='Договорённость').length}</div></div>
     </div>`;
-    
     let cardsHtml='';
     projects.forEach(proj=>{
         const reqs=allReqs.filter(r=>r.project===proj.name);
         const hasOverdue=reqs.some(r=>isOverdue(r));
         const allDone=reqs.length>0&&reqs.every(r=>['Оплачено','Договорённость','Отклонено'].includes(r.status));
         const cardClass=hasOverdue?'overdue':(allDone?'completed':'');
-        
         let startDate=new Date();
-        if(reqs.length>0){
-            let earliest=null;
-            reqs.forEach(r=>{
-                if(r.createdDate){
-                    const cd=new Date(r.createdDate);
-                    if(!earliest||cd<earliest)earliest=cd;
-                }
-            });
-            if(earliest)startDate=earliest;
-        }
-        
+        if(reqs.length>0){let earliest=null;reqs.forEach(r=>{if(r.createdDate){const cd=new Date(r.createdDate);if(!earliest||cd<earliest)earliest=cd}});if(earliest)startDate=earliest}
         let endDate=proj.deadline?new Date(proj.deadline):new Date(startDate.getTime()+86400000*30);
         if(startDate>endDate)endDate=new Date(startDate.getTime()+86400000*30);
-        
         const now=new Date();
         const totalMs=endDate.getTime()-startDate.getTime();
         const nowPct=totalMs>0?Math.max(0,Math.min(100,((now.getTime()-startDate.getTime())/totalMs)*100)):0;
         const barWidth=Math.max(10,Math.min(100,100));
-        
         let markersHtml='';
-        reqs.forEach(r=>{
-            if(r.audit){
-                r.audit.forEach(a=>{
-                    const at=new Date(a.timestamp);
-                    const pct=totalMs>0?Math.max(0,Math.min(100,((at.getTime()-startDate.getTime())/totalMs)*100)):0;
-                    let cls='status';
-                    if(a.action==='Создание заявки')cls='create';
-                    else if(a.action==='Редактирование')cls='edit';
-                    else if(a.action==='Загрузка файла')cls='file';
-                    else if(a.newStatus==='Отклонено')cls='reject';
-                    markersHtml+=`<div class="gantt-marker ${cls}" style="left:${pct}%"><div class="gantt-tooltip">${escapeHtml(a.timestamp.substring(5,16))} — ${escapeHtml(getUserDisplayName(a.actor))}: ${escapeHtml(a.action)}</div></div>`;
-                });
-            }
-        });
-        
+        reqs.forEach(r=>{if(r.audit){r.audit.forEach(a=>{const at=new Date(a.timestamp);const pct=totalMs>0?Math.max(0,Math.min(100,((at.getTime()-startDate.getTime())/totalMs)*100)):0;let cls='status';if(a.action==='Создание заявки')cls='create';else if(a.action==='Редактирование')cls='edit';else if(a.action==='Загрузка файла')cls='file';else if(a.newStatus==='Отклонено')cls='reject';markersHtml+=`<div class="gantt-marker ${cls}" style="left:${pct}%"><div class="gantt-tooltip">${escapeHtml(a.timestamp.substring(5,16))} — ${escapeHtml(getUserDisplayName(a.actor))}: ${escapeHtml(a.action)}</div></div>`})}});
         let allEvents=[];
         reqs.forEach(r=>{if(r.audit)r.audit.forEach(a=>allEvents.push({...a,reqId:r.id}))});
         allEvents.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
-        let chipsHtml=allEvents.slice(0,5).map(e=>{
-            let cls='status';if(e.action==='Создание заявки')cls='create';else if(e.action==='Редактирование')cls='edit';else if(e.action==='Загрузка файла')cls='file';
-            const icon=cls==='create'?'📝':cls==='edit'?'✏️':cls==='file'?'📎':'⚙️';
-            return`<div class="gantt-chip ${cls}"><span>${icon}</span><span>${escapeHtml(e.timestamp.substring(5,16))} ${escapeHtml(getUserDisplayName(e.actor))} — ${escapeHtml(e.reqId)}</span></div>`;
-        }).join('');
-        
+        let chipsHtml=allEvents.slice(0,5).map(e=>{let cls='status';if(e.action==='Создание заявки')cls='create';else if(e.action==='Редактирование')cls='edit';else if(e.action==='Загрузка файла')cls='file';const icon=cls==='create'?'📝':cls==='edit'?'✏️':cls==='file'?'📎':'⚙️';return`<div class="gantt-chip ${cls}"><span>${icon}</span><span>${escapeHtml(e.timestamp.substring(5,16))} ${escapeHtml(getUserDisplayName(e.actor))} — ${escapeHtml(e.reqId)}</span></div>`}).join('');
         const dlMs=endDate.getTime();
         const countdownClass=hasOverdue?'overdue':(allDone?'completed':'');
         const countdownLabel=allDone?'Статус':'До дедлайна';
         const countdownContent=allDone?`<div class="countdown-time" style="color:var(--success);font-size:1.1rem">✓ ГОТОВО</div><div class="countdown-ds" style="color:var(--success)">Проект завершён</div>`:`<div class="countdown-time"></div><div class="countdown-ds"></div>`;
-        
         let stagesHtml='<div class="gantt-stage"><div class="gantt-stage-icon">📝</div><div>Создание</div></div>';
         if(reqs.some(r=>r.files&&r.files.length>0))stagesHtml+='<div class="gantt-stage"><div class="gantt-stage-icon">📎</div><div>Файлы</div></div>';
         stagesHtml+='<div class="gantt-stage"><div class="gantt-stage-icon">⚙️</div><div>Обработка</div></div>';
         if(reqs.some(r=>['Оплачено','Договорённость'].includes(r.status)))stagesHtml+='<div class="gantt-stage"><div class="gantt-stage-icon">💰</div><div>Оплата</div></div>';
         stagesHtml+='<div class="gantt-stage"><div class="gantt-stage-icon">✅</div><div>Финал</div></div>';
-        
         const badgeHtml=hasOverdue?'<span class="overdue-badge">Просрочен</span>':(allDone?'<span style="font-size:12px;padding:4px 10px;background:rgba(19,115,51,.12);color:#137333;border-radius:12px;font-weight:500">✓ Завершён</span>':'<span style="font-size:12px;padding:4px 10px;background:rgba(26,115,232,.12);color:#1a73e8;border-radius:12px;font-weight:500">Активен</span>');
-        
         const startDateStr=startDate.toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:'numeric'});
         const endDateStr=endDate.toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:'numeric'});
-        
-        // 🔥 ИСПРАВЛЕНО: Добавлен data-project и cursor:pointer
         cardsHtml+=`
         <div class="gantt-card ${cardClass}" data-project="${escapeHtml(proj.name)}" style="cursor:pointer">
             <div class="gantt-header">
@@ -990,7 +1019,6 @@ function renderGanttDashboard(){
             <div class="gantt-events">${chipsHtml||'<span style="color:var(--text-secondary);font-size:12px">Нет событий</span>'}</div>
         </div>`;
     });
-    
     let legendHtml=`<div class="gantt-legend">
         <div class="gantt-legend-item"><div class="gantt-legend-bar" style="background:linear-gradient(90deg,#bbdefb,#64b5f6,#1a73e8)"></div><span>Активный</span></div>
         <div class="gantt-legend-item"><div class="gantt-legend-bar" style="background:linear-gradient(90deg,#c8e6c9,#66bb6a,#137333)"></div><span>Завершён</span></div>
@@ -1001,20 +1029,15 @@ function renderGanttDashboard(){
         <div class="gantt-legend-item"><div class="gantt-legend-dot" style="background:#1a73e8"></div><span>Правка</span></div>
         <div class="gantt-legend-item"><div class="gantt-legend-dot" style="background:#9334e6"></div><span>Файл</span></div>
     </div>`;
-    
     container.innerHTML=`<div class="back" id="backBtn">← Назад к проектам</div><h2>📊 Дашборд проектов</h2>${statsHtml}${cardsHtml}${legendHtml}`;
     document.getElementById('backBtn').addEventListener('click',()=>{CP=null;render()});
-    
-    // 🔥 ДОБАВЛЕНО: Обработчик клика на карточки проектов
     document.querySelectorAll('.gantt-card').forEach(card=>{
         card.addEventListener('click',(e)=>{
-            // Не срабатывать, если клик был на внутренних интерактивных элементах
             if(e.target.closest('.gantt-marker')||e.target.closest('.gantt-chip'))return;
             const projectName=card.dataset.project;
             if(projectName)openProject(projectName);
         });
     });
-    
     startGanttTimers();
 }
 
@@ -1025,7 +1048,6 @@ async function render(){
         container.innerHTML='';selectedMassIds=[];stopGanttTimers();
         if(!CP){
             let html='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:12px"><h3 style="margin:0">📂 Проекты</h3><div style="display:flex;gap:8px;flex-wrap:wrap">';
-            // 🔥 ИСПРАВЛЕНО: Кнопка дашборда
             if(U.role==='director'){html+=`<button class="btn btn-pri btn-sm" id="dashboardBtn">📊 Дашборд проектов</button><button class="btn btn-suc btn-sm" id="exportBtn">📥 Excel</button><button class="btn btn-gra btn-sm" id="deleteUserBtn">🗑️ Пользователи</button>`}
             html+='</div></div>';
             html+=`<div class="search-bar"><input type="text" id="globalSearch" placeholder="🔍 Поиск по заявкам..."><select id="filterStatus"><option value="">Все статусы</option>`;
@@ -1070,8 +1092,22 @@ function renderRequestsTable(reqs,showProject){
     const cm=U.role==='procurement'||U.role==='director';
     let html='<div class="table-wrapper"><table id="reqTable"><thead><tr>';if(cm)html+='<th style="width:40px"><input type="checkbox" class="mass-checkbox" id="selectAll"></th>';html+='<th>ID</th>';if(showProject)html+='<th>Проект</th>';html+='<th>Срок</th><th>Приоритет</th><th>Бюджет</th><th>Статус</th><th>Описание</th><th>Автор</th><th>Файлы</th><th>Действия</th></tr></thead><tbody>';
     reqs.forEach(r=>{const ds=getDisplayStatus(r);const sc=getStatusClass(ds);const ov=isOverdue(r);const ob=ov?'<span class="overdue-badge">⚠ Просрочено</span>':'';const wh=(U.role==='client'&&r.deadline&&r.status==='Отправлено на рассмотрение'&&getWorkingDaysDiff(new Date(),new Date(r.deadline))<5)?'<span class="warning">⚠ <5 дней</span>':'';const ad=getUserDisplayName(r.author);const vf=(r.files||[]).filter(f=>f&&typeof f==='object'&&f.path&&f.name&&typeof f.path==='string'&&typeof f.name==='string');const fh=vf.length>0?vf.map(f=>`<a class="file-item" href="/download/${encodeURI(f.path)}" target="_blank" onclick="event.stopPropagation()">📄 ${escapeHtml(f.name)}</a>`).join(''):'<span style="color:var(--text-secondary);font-size:12px">—</span>';
-    let btns='';const ce=(r.author===U.name&&r.status==='Отправлено на рассмотрение')||(U.role==='procurement')||(U.role==='director');if(ce&&!IsArch)btns+=`<button class="btn btn-gra btn-sm edit-btn" data-id="${r.id}">✏️</button>`;
-    if(!IsArch){if(U.role==='procurement'&&r.status==='Отправлено на рассмотрение'){btns+=`<button class="btn btn-wrn btn-sm action-btn" data-id="${r.id}" data-status="Выполняется">✓ Принять</button><button class="btn btn-dan btn-sm action-btn" data-id="${r.id}" data-status="Отклонено">✕ Отклонить</button>`}if(U.role==='director'&&r.status==='Выполняется'){btns+=`<button class="btn btn-suc btn-sm action-btn" data-id="${r.id}" data-status="Оплачено">💰 Оплачено</button><button class="btn btn-gra btn-sm action-btn" data-id="${r.id}" data-status="Договорённость">🤝 Договор.</button><button class="btn btn-dan btn-sm action-btn" data-id="${r.id}" data-status="Отклонено">✕</button>`}}
+    let btns='';
+    // 🔥 ПРАВА НА РЕДАКТИРОВАНИЕ:
+    // Заказчик (автор): только в статусе "Отправлено на рассмотрение"
+    // Снабжение: на любом не-финальном статусе
+    // Руководство: всегда
+    const finalStatuses=['Оплачено','Отклонено','Договорённость'];
+    const canEditByRole = (
+        (r.author===U.name && U.role==='client' && r.status==='Отправлено на рассмотрение') ||
+        (U.role==='procurement' && !finalStatuses.includes(r.status)) ||
+        (U.role==='director')
+    );
+    if(canEditByRole&&!IsArch)btns+=`<button class="btn btn-gra btn-sm edit-btn" data-id="${r.id}">✏️</button>`;
+    if(!IsArch){
+        if(U.role==='procurement'&&r.status==='Отправлено на рассмотрение'){btns+=`<button class="btn btn-wrn btn-sm action-btn" data-id="${r.id}" data-status="Выполняется">✓ Принять</button><button class="btn btn-dan btn-sm action-btn" data-id="${r.id}" data-status="Отклонено">✕ Отклонить</button>`}
+        if(U.role==='director'&&r.status==='Выполняется'){btns+=`<button class="btn btn-suc btn-sm action-btn" data-id="${r.id}" data-status="Оплачено">💰 Оплачено</button><button class="btn btn-gra btn-sm action-btn" data-id="${r.id}" data-status="Договорённость">🤝 Договор.</button><button class="btn btn-dan btn-sm action-btn" data-id="${r.id}" data-status="Отклонено">✕</button>`}
+    }
     btns+=`<button class="btn btn-gra btn-sm audit-btn" data-id="${r.id}" title="История">📋</button>`;
     html+=`<tr data-id="${r.id}" data-status="${r.status}" class="${ov?'overdue':''}">`;if(cm)html+=`<td><input type="checkbox" class="mass-checkbox row-checkbox" data-id="${r.id}"></td>`;html+=`<td><b>${escapeHtml(r.id)}</b>${ob}${wh}</td>`;if(showProject)html+=`<td><span class="project-link" data-project="${escapeHtml(r.project)}">${escapeHtml(r.project)}</span></td>`;html+=`<td>${escapeHtml(r.deadline||'—')}</td><td>${getPriorityIcon(r.priority)}</td><td>${r.budget?formatMoney(r.budget):'<span style="color:var(--text-secondary)">—</span>'}</td><td><span class="st ${sc}">${escapeHtml(ds)}</span></td><td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(r.body||'')}">${escapeHtml(r.body||'')}</td><td>${escapeHtml(ad)}</td><td>${fh}</td><td style="white-space:nowrap">${btns}</td></tr>`});
     html+='</tbody></table></div>';if(cm)html+=`<div id="massActionsBar" class="mass-actions-bar hidden"><span>Выбрано: <b id="massCount">0</b></span><div><button class="btn btn-sm" id="massAccept">✓ Принять все</button><button class="btn btn-sm" id="massReject">✕ Отклонить все</button></div></div>`;return html}
@@ -1091,7 +1127,43 @@ async function saveProjectDeadline(){const n=document.getElementById('editProjec
 function closeEditDeadlineModal(){document.getElementById('editProjectDeadlineModal').style.display='none'}
 async function openProject(p){CP=p;IsArch=(p!=='ALL_REQUESTS'&&p!=='PENDING_REQUESTS'&&D.projects.archive&&D.projects.archive.some(x=>{const name=(x&&typeof x==='object'&&x.name)?x.name:(typeof x==='string'?x:'');return name===p}));await render()}
 async function archiveProject(n){if(U.role!=='director')return showNotification("Нет прав");if(confirm('В архив "'+n+'"?')){const res=await api('/arc',{name:n});if(res.error)showNotification(res.error);else await loadData()}}
-function openModal(id=null){document.getElementById('mdl').style.display='flex';const fdd=document.getElementById('fdd');if(fdd)fdd.min=new Date().toISOString().split('T')[0];selectedFilesForUpload=[];document.getElementById('selectedFiles').innerHTML='';setupFileUpload();if(id){const r=D.requests.find(x=>x.id===id);if(!r)return;document.getElementById('mtl').innerText='Редактирование '+id;document.getElementById('fid').value=r.id;document.getElementById('fpr').value=r.project;fdd.value=r.deadline||'';document.getElementById('fpriority').value=r.priority||'medium';document.getElementById('fbudget').value=r.budget||'';document.getElementById('fbd').value=r.body||''}else{document.getElementById('mtl').innerText='Новая заявка';document.getElementById('fid').value='';document.getElementById('fpr').value=CP;fdd.value='';document.getElementById('fpriority').value='medium';document.getElementById('fbudget').value='';document.getElementById('fbd').value=''}const proj=D.projects.active.find(p=>p.name===CP);if(proj&&proj.deadline)fdd.max=proj.deadline;else fdd.removeAttribute('max')}
+function openModal(id=null){
+    document.getElementById('mdl').style.display='flex';
+    const fdd=document.getElementById('fdd');
+    if(fdd)fdd.min=new Date().toISOString().split('T')[0];
+    selectedFilesForUpload=[];
+    document.getElementById('selectedFiles').innerHTML='';
+    setupFileUpload();
+    if(id){
+        const r=D.requests.find(x=>x.id===id);if(!r)return;
+        document.getElementById('mtl').innerText='Редактирование '+id;
+        document.getElementById('fid').value=r.id;
+        document.getElementById('fpr').value=r.project;
+        fdd.value=r.deadline||'';
+        document.getElementById('fpriority').value=r.priority||'medium';
+        document.getElementById('fbudget').value=r.budget||'';
+        document.getElementById('fbd').value=r.body||'';
+        // 🔥 СКРЫВАЕМ приоритет от снабжения (они не могут его менять)
+        const priorityDiv=document.getElementById('fpriority').parentElement;
+        if(U && U.role==='procurement'){
+            priorityDiv.style.display='none';
+        } else {
+            priorityDiv.style.display='block';
+        }
+    } else {
+        document.getElementById('mtl').innerText='Новая заявка';
+        document.getElementById('fid').value='';
+        document.getElementById('fpr').value=CP;
+        fdd.value='';
+        document.getElementById('fpriority').value='medium';
+        document.getElementById('fbudget').value='';
+        document.getElementById('fbd').value='';
+        const priorityDiv=document.getElementById('fpriority').parentElement;
+        if(priorityDiv)priorityDiv.style.display='block';
+    }
+    const proj=D.projects.active.find(p=>p.name===CP);
+    if(proj&&proj.deadline)fdd.max=proj.deadline;else fdd.removeAttribute('max');
+}
 function closeModal(){document.getElementById('mdl').style.display='none'}
 function setupFileUpload(){const area=document.getElementById('fileUploadArea');const input=document.getElementById('fileInput');if(!area||!input)return;area.onclick=()=>input.click();area.ondragover=(e)=>{e.preventDefault();area.classList.add('dragover')};area.ondragleave=()=>area.classList.remove('dragover');area.ondrop=(e)=>{e.preventDefault();area.classList.remove('dragover');handleFiles(e.dataTransfer.files)};input.onchange=()=>handleFiles(input.files)}
 function handleFiles(files){selectedFilesForUpload=Array.from(files);const el=document.getElementById('selectedFiles');if(!el)return;el.innerHTML=selectedFilesForUpload.map((f,i)=>`<div class="file-item">📄 ${escapeHtml(f.name)} (${(f.size/1024).toFixed(1)}KB) <span onclick="event.stopPropagation();removeFile(${i})" style="cursor:pointer;color:var(--danger)">✕</span></div>`).join('')}
@@ -1121,7 +1193,26 @@ window.onload=()=>{
     document.getElementById('cancelDeleteUserBtn')?.addEventListener('click',()=>document.getElementById('deleteUserModal').style.display='none');
     document.getElementById('notificationBell')?.addEventListener('click',(e)=>toggleNotificationDropdown(e));
     document.addEventListener('click',function(e){const dropdown=document.getElementById('notificationDropdown');const bell=document.getElementById('notificationBell');if(!dropdown||!bell)return;if(!dropdown.contains(e.target)&&!bell.contains(e.target)&&dropdown.classList.contains('show'))dropdown.classList.remove('show')});
-    document.getElementById('frm')?.addEventListener('submit',async e=>{e.preventDefault();const fid=document.getElementById('fid').value;const fpr=document.getElementById('fpr').value;const fdd=document.getElementById('fdd').value;const fp=document.getElementById('fpriority').value;const fb=document.getElementById('fbudget').value;const fbd=document.getElementById('fbd').value;if(!fpr||!fdd||!fbd)return showNotification("Заполните поля");const proj=D.projects.active.find(p=>p.name===fpr);if(proj&&proj.deadline&&new Date(fdd)>new Date(proj.deadline))return showNotification("Срок не может превышать срок проекта");let res;if(fid)res=await api('/edt',{id:fid,body:fbd,deadline:fdd,priority:fp,budget:fb||null});else res=await api('/req',{project:fpr,deadline:fdd,body:fbd,priority:fp,budget:fb||null,author:U.name});if(res.error)showNotification(res.error);else{if(res.id&&selectedFilesForUpload.length>0)await uploadFilesForRequest(res.id);closeModal();playSound('success');await loadData();await updateUnreadCount()}});
+    document.getElementById('frm')?.addEventListener('submit',async e=>{
+        e.preventDefault();
+        const fid=document.getElementById('fid').value;
+        const fpr=document.getElementById('fpr').value;
+        const fdd=document.getElementById('fdd').value;
+        const fp=document.getElementById('fpriority').value;
+        const fb=document.getElementById('fbudget').value;
+        const fbd=document.getElementById('fbd').value;
+        if(!fpr||!fdd||!fbd)return showNotification("Заполните поля");
+        const proj=D.projects.active.find(p=>p.name===fpr);
+        if(proj&&proj.deadline&&new Date(fdd)>new Date(proj.deadline))return showNotification("Срок не может превышать срок проекта");
+        let res;
+        if(fid)res=await api('/edt',{id:fid,body:fbd,deadline:fdd,priority:fp,budget:fb||null});
+        else res=await api('/req',{project:fpr,deadline:fdd,body:fbd,priority:fp,budget:fb||null,author:U.name});
+        if(res.error)showNotification(res.error);
+        else{
+            if(res.id&&selectedFilesForUpload.length>0)await uploadFilesForRequest(res.id);
+            closeModal();playSound('success');await loadData();await updateUnreadCount();
+        }
+    });
     try{const saved=localStorage.getItem('z1u');const token=localStorage.getItem('z1t');if(saved&&token){U=JSON.parse(saved);TOKEN=token;showApp();loadData();updateUnreadCount();requestNotificationPermission();startNotificationChecker()}}catch(e){}
 };
 </script>
