@@ -1,5 +1,5 @@
-﻿# ==========================================================
-# 🚀 ФОРМА ЗАЯВКИ 3.7.7 (FIX DUPLICATES + isArchived)
+# ==========================================================
+# 🚀 ФОРМА ЗАЯВКИ 3.7.8 (RESTORED USERS FIX)
 # ==========================================================
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path $MyInvocation.MyCommand.Path
@@ -26,7 +26,7 @@ $script:Sessions = @{}
 # ==========================================================
 $defaultDb = @{
     system = @{
-        version = "3.7.7"
+        version = "3.7.8"
         statuses = @(
             @{ name = "Отправлено на рассмотрение"; availableFrom = @(); availableFor = @("client", "procurement") }
             @{ name = "Выполняется"; availableFrom = @("Отправлено на рассмотрение"); availableFor = @("procurement") }
@@ -139,7 +139,7 @@ function Set-Db($data) {
 }
 
 # ==========================================================
-# 🔧 БЛОК 3: МИГРАЦИЯ (С isArchived)
+# 🔧 БЛОК 3: МИГРАЦИЯ (С АВТОСБРОСОМ authorDeleted)
 # ==========================================================
 function Get-PasswordHash($password, $salt) {
     $combined = $salt + $password
@@ -171,7 +171,7 @@ function Test-StatusesValid($statuses) {
 }
 
 function Migrate-Database {
-    Write-Host "🔄 Миграция БД v3.7.7..." -ForegroundColor Magenta
+    Write-Host "🔄 Миграция БД v3.7.8..." -ForegroundColor Magenta
     $db = Get-Db
     $changed = $false
 
@@ -260,7 +260,7 @@ function Migrate-Database {
             deadline = $null; body = $null; status = "Отправлено на рассмотрение"
             author = $null; authorDeleted = $false; authorDeletedAt = $null
             priority = "medium"; takenBy = $null; comment = $null; audit = @()
-            lastDeadlineNotify = $null; budget = $null; files = @()
+            lastDeadlineNotify = $null; budget = $null; files = @(); isArchived = $false
         }
         foreach ($prop in $defaultProps.Keys) {
             if ($r.PSObject.Properties.Name -notcontains $prop) {
@@ -269,7 +269,6 @@ function Migrate-Database {
             }
         }
         
-        # 🔥 НОВОЕ: Добавляем поле isArchived
         if ($r.PSObject.Properties.Name -notcontains 'isArchived') {
             $isInArchive = $db.projects.archive | Where-Object { $_.name -eq $r.project }
             $r | Add-Member -NotePropertyName 'isArchived' -NotePropertyValue ($null -ne $isInArchive) -Force
@@ -288,6 +287,17 @@ function Migrate-Database {
         }
         if ($cleanFiles.Count -ne @($r.files).Count) {
             $r.files = $cleanFiles
+        }
+        
+        # 🔥 НОВОЕ v3.7.8: Сбрасываем authorDeleted если пользователь снова активен
+        if ($r.authorDeleted -eq $true -and $r.author) {
+            $activeUser = $db.auth.users | Where-Object { $_.name -eq $r.author -and $_.deleted -eq $false } | Select-Object -First 1
+            if ($activeUser) {
+                $r.authorDeleted = $false
+                $r.authorDeletedAt = $null
+                $changed = $true
+                Write-Host "✅ Сброшен authorDeleted у заявки $($r.id) (автор $($r.author) восстановлен)" -ForegroundColor Green
+            }
         }
         
         if ($r.status -eq "В работу") { $r.status = "Выполняется"; $changed = $true }
@@ -403,33 +413,37 @@ function Auth-RecoverReset($username, $code, $newPassword) {
     return @{ok=$true}
 }
 
-# 🔥 ИСПРАВЛЕНО: Идемпотентная функция - не дублирует "(Удалён)"
+# 🔥 ИСПРАВЛЕНО v3.7.8: Идемпотентная функция, проверяющая актуальный статус
 function Get-UserDisplayName($nameOrUsername, $db) {
     if (-not $nameOrUsername) { return "[Неизвестно]" }
     
-    # Если имя уже содержит "(Удалён", возвращаем как есть
+    # Если имя уже содержит "(Удалён", возвращаем как есть (идемпотентность)
     if ($nameOrUsername -match '\(Удалён') {
         return $nameOrUsername
     }
     
-    # Ищем пользователя по имени
-    $user = $db.auth.users | Where-Object { $_.name -eq $nameOrUsername } | Select-Object -First 1
+    # Ищем АКТИВНОГО пользователя (deleted=false)
+    $activeUser = $db.auth.users | Where-Object { $_.name -eq $nameOrUsername -and $_.deleted -eq $false } | Select-Object -First 1
     
-    if (-not $user) {
-        # Может быть передан username (email)?
-        $user = $db.auth.users | Where-Object { $_.username -eq $nameOrUsername } | Select-Object -First 1
+    if (-not $activeUser) {
+        # Пробуем найти по username
+        $activeUser = $db.auth.users | Where-Object { $_.username -eq $nameOrUsername -and $_.deleted -eq $false } | Select-Object -First 1
     }
     
-    if ($user) {
-        $displayName = $user.name
-        # Если имя уже содержит "(Удалён", не добавляем снова
-        if ($user.deleted -eq $true -and $displayName -notmatch '\(Удалён') {
-            $deletedAt = if ($user.deletedAt) { $user.deletedAt } else { "дата неизвестна" }
-            return "$displayName (Удалён $deletedAt)"
-        }
-        return $displayName
+    # Если активный пользователь найден - возвращаем просто имя (без "(Удалён)")
+    if ($activeUser) {
+        return $activeUser.name
     }
     
+    # Пользователь не активен - ищем удалённого
+    $deletedUser = $db.auth.users | Where-Object { $_.name -eq $nameOrUsername -and $_.deleted -eq $true } | Select-Object -First 1
+    
+    if ($deletedUser) {
+        $deletedAt = if ($deletedUser.deletedAt) { $deletedUser.deletedAt } else { "дата неизвестна" }
+        return "$nameOrUsername (Удалён $deletedAt)"
+    }
+    
+    # Пользователь вообще не найден в базе
     return $nameOrUsername
 }
 
@@ -450,7 +464,7 @@ function Action-DeleteUser($username, $actorRole) {
 }
 
 # ==========================================================
-# 📧 БЛОК 5: EMAIL (БЕЗ ДУБЛИРОВАНИЯ РОЛЕЙ)
+# 📧 БЛОК 5: EMAIL
 # ==========================================================
 function Send-Mail($to, $subj, $body) {
     try {
@@ -478,7 +492,7 @@ function Notify-SupplierNew($req) {
     }
 }
 
-# 🔥 ИСПРАВЛЕНО: Убран лишний маппинг ролей в письмах
+# 🔥 Get-UserDisplayName теперь сама проверяет актуальный статус
 function Notify-AllParticipants($req, $newStatus, $actor, $comment, $eventType = "status_change") {
     $db = Get-Db
     $authorDisplay = Get-UserDisplayName $req.author $db
@@ -632,7 +646,7 @@ $(if($req.budget){"<p><b>Бюджет:</b> $($req.budget) ₽</p>"})
 }
 
 # ==========================================================
-# 💼 БЛОК 6: BUSINESS LOGIC (С isArchived)
+# 💼 БЛОК 6: BUSINESS LOGIC
 # ==========================================================
 function AddAuditEntry($req, $actor, $newStatus, $comment, $action = "Изменение статуса") {
     $entry = [PSCustomObject]@{
@@ -770,13 +784,11 @@ function Action-BulkProcess($ids, $status, $actor, $userRole, $comment="") {
 
 function Action-Reject($id, $reason, $actor, $userRole) { return Action-Process $id "Отклонено" $actor $userRole $reason }
 
-# 🔥 ИСПРАВЛЕНО: Помечаем заявки как архивные
 function Action-Archive($name, $role) {
     if ($role -ne "director") { return @{ok=$false; error="Только руководитель"} }
     $db = Get-Db
     $proj = $db.projects.active | Where-Object { $_.name -eq $name.Trim() }
     if ($proj) {
-        # Помечаем все заявки этого проекта как архивные
         foreach ($r in $db.requests) {
             if ($r.project -eq $name.Trim()) {
                 $r | Add-Member -NotePropertyName 'isArchived' -NotePropertyValue $true -Force
@@ -1022,7 +1034,10 @@ function Export-Excel($force = $false) {
         @("ID","Проект","Дата","Срок","Статус","Приоритет","Бюджет","Описание","Автор","Файлы") | ForEach-Object -Begin {$i=0} -Process { $i++; $ws.Cells(1,$i).Value2 = $_; $ws.Cells(1,$i).Font.Bold = $true }
         for ($row = 0; $row -lt $reqs.Count; $row++) {
             $r = $reqs[$row]
-            $authorDisplay = if ($r.authorDeleted) { "$($r.author) (Удалён)" } else { $r.author }
+            # 🔥 v3.7.8: Проверяем актуальный статус пользователя
+            $db = Get-Db
+            $activeUser = $db.auth.users | Where-Object { $_.name -eq $r.author -and $_.deleted -eq $false } | Select-Object -First 1
+            $authorDisplay = if ($activeUser) { $r.author } elseif ($r.authorDeleted) { "$($r.author) (Удалён)" } else { $r.author }
             $validFiles = @($r.files | Where-Object { $_ -and $_ -is [PSCustomObject] -and $_.name })
             $filesList = if ($validFiles.Count -gt 0) { ($validFiles | ForEach-Object { $_.name }) -join ", " } else { "" }
             $ws.Cells($row+2,1).Value2 = $r.id
@@ -1045,7 +1060,7 @@ function Export-Excel($force = $false) {
 }
 
 # ==========================================================
-# 🎨 БЛОК 9: UI (С ФИЛЬТРОМ isArchived)
+# 🎨 БЛОК 9: UI (HTML/CSS/JS - с исправлением "(Удалён)")
 # ==========================================================
 $ui = @'
 <!DOCTYPE html>
@@ -1053,7 +1068,7 @@ $ui = @'
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Форма заявки 3.7.7</title>
+<title>Форма заявки 3.7.8</title>
 <link rel="icon" href="data:,">
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
 <style>
@@ -1316,6 +1331,32 @@ const ROLE_NAMES = {
 };
 function getRoleName(role) { return ROLE_NAMES[role] || role; }
 
+// 🔥 v3.7.8: Функция получения отображаемого имени с проверкой актуального статуса
+function getUserDisplayName(nameOrUsername) {
+    if (!nameOrUsername) return '[Неизвестно]';
+    if (!D || !D.auth || !D.auth.users) return nameOrUsername;
+    
+    // Если имя уже содержит "(Удалён", не дублируем
+    if (String(nameOrUsername).includes('(Удалён')) {
+        return nameOrUsername;
+    }
+    
+    // Ищем АКТИВНОГО пользователя
+    const activeUser = D.auth.users.find(u => (u.name === nameOrUsername || u.username === nameOrUsername) && !u.deleted);
+    if (activeUser) {
+        return activeUser.name;
+    }
+    
+    // Ищем удалённого
+    const deletedUser = D.auth.users.find(u => u.name === nameOrUsername && u.deleted);
+    if (deletedUser) {
+        const deletedAt = deletedUser.deletedAt || 'дата неизвестна';
+        return `${nameOrUsername} (Удалён ${deletedAt})`;
+    }
+    
+    return nameOrUsername;
+}
+
 let D=null, CP=null, U=null, PE=null, IsArch=false, TOKEN=null;
 let notifications=[], lastCheckTime=null, checkInterval=null;
 let selectedMassIds=[], selectedFilesForUpload=[];
@@ -1526,9 +1567,11 @@ function showAudit(requestId){
         else if(entry.action==='Загрузка файла')typeClass='edit';
         else if(entry.newStatus==='Отклонено')typeClass='reject';
         let commentHtml=entry.comment&&entry.comment.trim()&&entry.comment.trim()!==' '?`<div class="timeline-comment">💬 ${escapeHtml(entry.comment)}</div>`:'';
+        // 🔥 v3.7.8: Используем getUserDisplayName
+        const actorDisplay = getUserDisplayName(entry.actor);
         html+=`<div class="timeline-item ${typeClass}">
             <div class="timeline-time">${escapeHtml(entry.timestamp)}</div>
-            <div class="timeline-actor">👤 ${escapeHtml(entry.actor)}</div>
+            <div class="timeline-actor">👤 ${escapeHtml(actorDisplay)}</div>
             <div class="timeline-action">${escapeHtml(entry.action)} → <b>${escapeHtml(entry.newStatus)}</b></div>
             ${commentHtml}
         </div>`;
@@ -1768,8 +1811,9 @@ function renderRequestsTable(reqs,showProject){
         const overdue=isOverdue(r);
         const overdueBadge=overdue?'<span class="overdue-badge">⚠ Просрочено</span>':'';
         const warningHtml=(U.role==='client'&&r.deadline&&r.status==='Отправлено на рассмотрение'&&getWorkingDaysDiff(new Date(),new Date(r.deadline))<5)?'<span class="warning">⚠ <5 дней</span>':'';
-        const authorDisplay=r.authorDeleted?`${escapeHtml(r.author)} <span class="deleted-user">(Удалён)</span>`:escapeHtml(r.author);
         
+        // 🔥 ИСПРАВЛЕНО v3.7.8: Проверяем актуальный статус через getUserDisplayName
+        const authorDisplay = getUserDisplayName(r.author);
         const validFiles=(r.files||[]).filter(f=>f&&typeof f==='object'&&f.path&&f.name&&typeof f.path==='string'&&typeof f.name==='string');
         const filesHtml=validFiles.length>0?validFiles.map(f=>`<a class="file-item" href="/download/${encodeURI(f.path)}" target="_blank" onclick="event.stopPropagation()">📄 ${escapeHtml(f.name)}</a>`).join(''):'<span style="color:var(--text-secondary);font-size:12px">—</span>';
 
@@ -1799,7 +1843,7 @@ function renderRequestsTable(reqs,showProject){
         html+=`<td>${r.budget?formatMoney(r.budget):'<span style="color:var(--text-secondary)">—</span>'}</td>`;
         html+=`<td><span class="st ${statusClass}">${escapeHtml(displayStatus)}</span></td>`;
         html+=`<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(r.body||'')}">${escapeHtml(r.body||'')}</td>`;
-        html+=`<td>${authorDisplay}</td>`;
+        html+=`<td>${escapeHtml(authorDisplay)}</td>`;
         html+=`<td>${filesHtml}</td>`;
         html+=`<td style="white-space:nowrap">${btns}</td>`;
         html+='</tr>';
@@ -1867,7 +1911,6 @@ function showEditDeadlineModal(name){const p=D.projects.active.find(x=>x.name===
 async function saveProjectDeadline(){const n=document.getElementById('editProjectName').value;const d=document.getElementById('editProjectDeadline').value;if(!d)return showNotification("Укажите срок");const res=await api('/update-project-deadline',{name:n,deadline:d});if(res.error)showNotification(res.error);else{closeEditDeadlineModal();await loadData()}}
 function closeEditDeadlineModal(){document.getElementById('editProjectDeadlineModal').style.display='none'}
 
-// 🔥 ИСПРАВЛЕНО: Фильтр isArchived для заявок
 async function openProject(p){
     CP=p;
     IsArch=(p!=='ALL_REQUESTS'&&p!=='PENDING_REQUESTS'&&D.projects.archive&&D.projects.archive.some(x=>{const name=(x&&typeof x==='object'&&x.name)?x.name:(typeof x==='string'?x:'');return name===p}));
@@ -1997,10 +2040,10 @@ foreach ($ip in $localIps) { Add-UrlAcl -url "http://$ip`:$port/" }
 
 try {
     $listener.Start()
-    Write-Host "`n🟢 ФОРМА ЗАЯВКИ 3.7.7 ЗАПУЩЕНА!`n" -ForegroundColor Green
+    Write-Host "`n🟢 ФОРМА ЗАЯВКИ 3.7.8 ЗАПУЩЕНА!`n" -ForegroundColor Green
     Write-Host "📍 http://localhost:$port" -ForegroundColor Cyan
     foreach ($ip in $localIps) { Write-Host "📍 http://$ip`:$port" -ForegroundColor Yellow }
-    Write-Host "`n💡 Firewall: New-NetFirewallRule -DisplayName 'Zayavka377' -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow`n" -ForegroundColor White
+    Write-Host "`n💡 Firewall: New-NetFirewallRule -DisplayName 'Zayavka378' -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow`n" -ForegroundColor White
 } catch {
     Write-Host "`n❌ Ошибка: $_" -ForegroundColor Red
     Write-Host "💡 Запустите от Администратора" -ForegroundColor Yellow
