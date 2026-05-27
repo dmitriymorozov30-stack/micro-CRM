@@ -11,11 +11,11 @@ $port = 9000
 if (-not (Test-Path $uploadsDir)) { New-Item -ItemType Directory -Path $uploadsDir | Out-Null }
 
 $smtpCfg = @{
-    Server   = "mail-01"
+    Server   = "mail"
     Port     = 25
-    From     = "support@stroisservis.ru"
-    User     = "support@stroisservis.ru"
-    Password = 'RI2b}mb*A?yvrF9fEj'
+    From     = ""
+    User     = ""
+    Password = ''
 }
 
 $dbMutex = New-Object System.Threading.Mutex($false, "ZayavkaDbMutex_v31")
